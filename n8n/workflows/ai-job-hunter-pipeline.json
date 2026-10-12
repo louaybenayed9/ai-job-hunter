@@ -1,0 +1,249 @@
+{
+  "id": "aiJobHunterPipeline",
+  "name": "AI Job Hunter - Scrape & Score Pipeline",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Tunis"
+  },
+  "pinData": {},
+  "nodes": [
+    {
+      "id": "a1f0b1c2-0001-4a00-9000-000000000001",
+      "name": "Daily 8AM (Tunis)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-460, 0],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a1f0b1c2-0002-4a00-9000-000000000002",
+      "name": "Build Search Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-260, 0],
+      "parameters": {
+        "jsCode": "// Everything downstream reads these values.\n// Change the query here (or add a Webhook/Email trigger in parallel).\n// The threshold comes from MATCH_SCORE_THRESHOLD in .env (default 75).\nreturn [{\n  json: {\n    keywords: 'developpeur python',\n    limit: 15,\n    threshold: Number($env.MATCH_SCORE_THRESHOLD || 75)\n  }\n}];"
+      }
+    },
+    {
+      "id": "a1f0b1c2-0003-4a00-9000-000000000003",
+      "name": "Scrape Keejob",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-60, 0],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SCRAPE_API_URL }}/scrape/keejob",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "keywords", "value": "={{ $json.keywords }}" },
+            { "name": "limit", "value": "={{ $json.limit }}" }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "a1f0b1c2-0004-4a00-9000-000000000004",
+      "name": "Extract Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [140, 0],
+      "parameters": {
+        "jsCode": "const query = $('Build Search Query').first().json;\nconst payload = $input.first().json;\n\nif (payload.status === 'error') {\n  throw new Error('Scraper error: ' + payload.message);\n}\n\nconst jobs = payload.jobs || [];\nif (jobs.length === 0) {\n  throw new Error('Scraper returned no jobs for: ' + query.keywords);\n}\n\n// One output item per job, carrying the original query + threshold\nreturn jobs.map((job) => ({\n  json: { ...job, keywords: query.keywords, threshold: query.threshold }\n}));"
+      }
+    },
+    {
+      "id": "a1f0b1c2-0005-4a00-9000-000000000005",
+      "name": "Score Job with LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [340, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AI_SERVICE_URL }}/score",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job: { title: $json.title, company: $json.company, location: $json.location, description: $json.description, link: $json.link, source: $json.source }, keywords: $json.keywords }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "a1f0b1c2-0006-4a00-9000-000000000006",
+      "name": "Normalize Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [540, 0],
+      "parameters": {
+        "jsCode": "// Flattens the ai-service response into one stable shape for the IF,\n// Telegram and Google Sheets nodes: match_score / match_rationale / missing_skills\nreturn $input.all().map((item) => {\n  const body = item.json;\n  const job = $('Extract Jobs').item.json; // keeps pairing with the source job\n\n  if (body.status === 'error') {\n    return {\n      json: {\n        ...job,\n        match_score: 0,\n        verdict: 'skip',\n        matched_skills: [],\n        missing_skills: [],\n        match_rationale: 'Scoring failed: ' + body.message,\n        model: null,\n        checked_at: new Date().toISOString()\n      }\n    };\n  }\n\n  const result = body.result || {};\n  return {\n    json: {\n      title: job.title,\n      company: job.company,\n      location: job.location,\n      link: job.link,\n      source: job.source,\n      keywords: job.keywords,\n      threshold: job.threshold,\n      match_score: result.score,\n      verdict: result.verdict,\n      matched_skills: result.matched_skills || [],\n      missing_skills: result.missing_skills || [],\n      match_rationale: result.rationale,\n      model: result.model,\n      checked_at: new Date().toISOString()\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "a1f0b1c2-0007-4a00-9000-000000000007",
+      "name": "Match Score >= threshold?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [740, 0],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2e0b1c2-0001-4a00-9000-000000000001",
+              "leftValue": "={{ $json.match_score }}",
+              "rightValue": "={{ $json.threshold }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte",
+                "singleValue": false
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a1f0b1c2-0008-4a00-9000-000000000008",
+      "name": "Format Telegram Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, -100],
+      "parameters": {
+        "jsCode": "// Builds one rich MarkdownV2 alert per passing job. Dynamic values are\n// escaped because Telegram's MarkdownV2 rejects unescaped\n// _ * [ ] ( ) ~ ` > # + - = | { } . !\n// Note: inside Code nodes use $input/$(), NOT $json (that shortcut is expressions-only).\nconst esc = (v) => String(v ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!\\\\])/g, '\\\\$1');\n\nreturn $input.all().map((item) => {\n  const j = item.json;\n  const missing = Array.isArray(j.missing_skills) && j.missing_skills.length\n    ? j.missing_skills.map(esc).join(', ')\n    : 'None flagged';\n\n  const text = [\n    `🎯 *Match Score:* ${esc(j.match_score)}/100`,\n    `💼 *Title:* ${esc(j.title)}`,\n    `🏢 *Company:* ${esc(j.company || 'n/a')}`,\n    `📍 *Location:* ${esc(j.location || 'n/a')}`,\n    `🔗 *Apply Link:* ${esc(j.link)}`,\n    `💡 *Key Match Rationale:* ${esc(j.match_rationale || 'n/a')}`,\n    `⚠️ *Missing Skills / Gaps:* ${missing}`\n  ].join('\\n');\n\n  return { json: { ...j, telegram_text: text } };\n});"
+      }
+    },
+    {
+      "id": "a1f0b1c2-0009-4a00-9000-000000000009",
+      "name": "Telegram Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, -100],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, parse_mode: 'MarkdownV2', disable_web_page_preview: true, text: $json.telegram_text }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "a1f0b1c2-0010-4a00-9000-000000000010",
+      "name": "Append to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1340, -100],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_SPREADSHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_SHEET_NAME }}",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Title": "={{ $json.title }}",
+            "Company": "={{ $json.company }}",
+            "Location": "={{ $json.location }}",
+            "Score": "={{ $json.match_score }}",
+            "Verdict": "={{ $json.verdict }}",
+            "Source": "={{ $json.source }}",
+            "Link": "={{ $json.link }}",
+            "Rationale": "={{ $json.match_rationale }}",
+            "Checked at": "={{ $json.checked_at }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a1f0b1c2-0011-4a00-9000-000000000011",
+      "name": "Below threshold",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [940, 120],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Daily 8AM (Tunis)": {
+      "main": [[{ "node": "Build Search Query", "type": "main", "index": 0 }]]
+    },
+    "Build Search Query": {
+      "main": [[{ "node": "Scrape Keejob", "type": "main", "index": 0 }]]
+    },
+    "Scrape Keejob": {
+      "main": [[{ "node": "Extract Jobs", "type": "main", "index": 0 }]]
+    },
+    "Extract Jobs": {
+      "main": [[{ "node": "Score Job with LLM", "type": "main", "index": 0 }]]
+    },
+    "Score Job with LLM": {
+      "main": [[{ "node": "Normalize Score", "type": "main", "index": 0 }]]
+    },
+    "Normalize Score": {
+      "main": [[{ "node": "Match Score >= threshold?", "type": "main", "index": 0 }]]
+    },
+    "Match Score >= threshold?": {
+      "main": [
+        [{ "node": "Format Telegram Message", "type": "main", "index": 0 }],
+        [{ "node": "Below threshold", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Telegram Message": {
+      "main": [[{ "node": "Telegram Notification", "type": "main", "index": 0 }]]
+    },
+    "Telegram Notification": {
+      "main": [[{ "node": "Append to Google Sheet", "type": "main", "index": 0 }]]
+    }
+  }
+}
